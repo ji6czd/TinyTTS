@@ -62,7 +62,8 @@ static float gt[GT + 1];                  /* glottal flow pulse table */
 typedef struct {
     Seg *seg; int n, cap; float speed;
     int si, fi, nf; Par prev;
-    float f0c, phase, dph, P, gprev;
+    float f0c, phase, dph, P, gprev, drift;
+    float sm1[NSLOW], sm2[NSLOW];         /* 2-stage smoothed slow params (articulator inertia) */
     uint32_t rng;
     Res r[5];
     float aA, aB, aC, x1, x2;             /* nasal antiresonator */
@@ -86,16 +87,21 @@ static int tts_frame(Tts *t, float *o) {
     if (t->si >= t->n) return 0;
     Seg *s = &t->seg[t->si];
     float u = t->fi * FRMS + FRMS;
-    float wf = s->tr > 0 ? fminf(1, u / s->tr) : 1;
     float wa = s->hard ? 1 : fminf(1, u / AMPTR);
     Par c; float *cp = (float *)&c, *pp = (float *)&t->prev, *sp = (float *)&s->p;
-    for (int k = 0; k < NPAR; k++) {
-        float w = k < NSLOW ? wf : wa;
-        cp[k] = pp[k] + (sp[k] - pp[k]) * w;
+    /* formants etc.: two cascaded one-pole chasers -> S-shaped motion, short phones undershoot */
+    float ka = 1 - expf(-FRMS / fmaxf(s->tr / 3, 2.0f));
+    for (int k = 0; k < NSLOW; k++) {
+        t->sm1[k] += (sp[k] - t->sm1[k]) * ka;
+        t->sm2[k] += (t->sm1[k] - t->sm2[k]) * ka;
+        cp[k] = t->sm2[k];
     }
-    /* pitch smoothing */
+    for (int k = NSLOW; k < NPAR; k++) cp[k] = pp[k] + (sp[k] - pp[k]) * wa;
+    /* pitch smoothing + slow natural drift (~±1%) */
     float tau = s->f0 < t->f0c ? 18.0f : 28.0f;
     t->f0c += (s->f0 - t->f0c) * (1 - expf(-FRMS / tau));
+    t->drift += (rnd(t) - t->drift) * 0.03f;
+    float f0u = t->f0c * (1 + 0.03f * t->drift);
 
     res_set(&t->r[0], c.f1, c.b1); res_set(&t->r[1], c.f2, c.b2); res_set(&t->r[2], c.f3, c.b3);
     res_set(&t->r[3], 3300, 250);  res_set(&t->r[4], 4300, 300);
@@ -113,7 +119,7 @@ static int tts_frame(Tts *t, float *o) {
         t->phase += t->dph;
         if (t->phase >= 1) {
             t->phase -= 1;
-            t->P = FS / t->f0c * (1 + 0.004f * rnd(t));      /* tiny jitter */
+            t->P = FS / f0u * (1 + 0.004f * rnd(t));         /* tiny jitter */
             t->dph = 1 / t->P;
         }
         float x = t->phase * GT; int i0 = (int)x; float g = gt[i0] + (gt[i0 + 1] - gt[i0]) * (x - i0);
@@ -174,7 +180,20 @@ static void build_N(Tts *t, Mora *m, Mora *nx) {
     push(t, p, 90 * m->stretch, 18, 0, m->f0);
 }
 
-static void build_mora(Tts *t, Mora *m) {
+/* vowel as two parts: onset, then drift toward the next vowel (never a flat plateau) */
+static void pushV(Tts *t, Par V, float vd, float tr, Mora *m, Mora *nx) {
+    float f0 = m->f0;
+    if (m->dev) { push(t, V, vd, tr, 0, f0); return; }
+    f0 *= (m->v == 'i' || m->v == 'u') ? 1.03f : m->v == 'a' ? 0.98f : 1.0f;      /* intrinsic pitch */
+    float f0a = f0 * (vless(m->c) ? 1.05f : 1.0f);                                 /* onset after voiceless C */
+    Par B = V;
+    if (nx && nx->type == 0 && nx->v) B = mixF(V, vowelPar(nx->v), nx->c[0] ? 0.25f : 0.4f);
+    B.av = 0.88f;
+    push(t, V, vd * 0.45f, tr * 1.6f, 0, f0a);
+    push(t, B, vd * 0.55f, 45, 0, f0);
+}
+
+static void build_mora(Tts *t, Mora *m, Mora *nx) {
     const char *c = m->c; char v = m->v; float f0 = m->f0;
     Par V = vowelPar(v);
     float vd = (m->lng ? 95 : 75) * m->stretch;
@@ -183,7 +202,7 @@ static void build_mora(Tts *t, Mora *m) {
     int pal = (c[1] == 'y');
     int gem = m->gem;
 
-    if (!c[0]) { push(t, V, vd, 35, 0, f0); return; }
+    if (!c[0]) { pushV(t, V, vd, 35, m, nx); return; }
 
     Par C = base(); C.f1 = 350;
     /* place of articulation -> formant locus */
@@ -201,26 +220,26 @@ static void build_mora(Tts *t, Mora *m) {
         Par cl = C; push(t, cl, closure, 10, 0, f0);
         Par fp = C; fp.fr = ts ? 1.0f : 0.8f; fp.ff = ts ? 5600 : 3200; fp.fb = ts ? 2600 : 1800;
         push(t, fp, 70, 4, 1, f0);
-        push(t, V, vd, 28, 0, f0); return;
+        pushV(t, V, vd, 28, m, nx); return;
     }
     if (c[0] == 'j') {                                            /* voiced affricate */
         Par cl = C; cl.f1 = 200; cl.av = 0.2f; push(t, cl, 30, 10, 0, f0);
         Par fp = C; fp.f1 = 250; fp.av = 0.5f; fp.fr = 0.45f; fp.ff = 3200; fp.fb = 1800; push(t, fp, 50, 4, 0, f0);
-        push(t, V, vd, 28, 0, f0); return;
+        pushV(t, V, vd, 28, m, nx); return;
     }
     if (c[0] == 'z') {
         Par fp = C; fp.f1 = 250; fp.av = 0.55f; fp.fr = 0.5f; fp.ff = 5500; fp.fb = 2600; push(t, fp, 65, 10, 0, f0);
-        push(t, V, vd, 28, 0, f0); return;
+        pushV(t, V, vd, 28, m, nx); return;
     }
     if (c[0] == 's') {
         Par fp = C;
         if (c[1] == 'h') { fp.fr = 1.0f; fp.ff = 3000; fp.fb = 1800; push(t, fp, 95 + (gem ? 45 : 0), 10, 0, f0); }
         else { fp.fr = 1.0f; fp.ff = 5800; fp.fb = 2600; push(t, fp, 85 + (gem ? 45 : 0), 10, 0, f0); }
-        push(t, V, vd, 28, 0, f0); return;
+        pushV(t, V, vd, 28, m, nx); return;
     }
     if (c[0] == 'f') {
         Par fp = C; fp.fr = 0.45f; fp.ff = 2800; fp.fb = 3500; push(t, fp, 75 + (gem ? 40 : 0), 10, 0, f0);
-        push(t, V, vd, 25, 0, f0); return;
+        pushV(t, V, vd, 25, m, nx); return;
     }
     if (c[0] == 'h') {
         Par ap = (c[1] == 'y') ? vowelPar('i') : V;
@@ -254,7 +273,7 @@ static void build_mora(Tts *t, Mora *m) {
         Par g = vowelPar('i'); if (m->dev) { g.av = 0; g.ah = 0.5f; }
         push(t, g, 32, 15, 0, f0);
     }
-    push(t, V, vd, 28, 0, f0);
+    pushV(t, V, vd, 28, m, nx);
 }
 
 /* ------------------------------------------------------------ front-end */
@@ -388,10 +407,10 @@ static void tts_build(Tts *t, const char *utf8, float speed, float f0) {
         lastf0 = m->f0;
         if (m->type == 1) build_N(t, m, nx);
         else if (m->type == 2) { if (!nx || nx->type != 0 || !strchr("kgtdpbsctfh", nx->c[0] ? nx->c[0] : 'x')) silence(t, 60, m->f0); }
-        else build_mora(t, m);
+        else build_mora(t, m, nx);
     }
     silence(t, 150, lastf0);
-    t->prev = base(); t->f0c = t->seg[0].f0; t->P = FS / t->f0c; t->dph = 1 / t->P;
+    t->prev = base(); memcpy(t->sm1, &t->seg[0].p, sizeof t->sm1); memcpy(t->sm2, &t->seg[0].p, sizeof t->sm2); t->f0c = t->seg[0].f0; t->P = FS / t->f0c; t->dph = 1 / t->P;
     t->nf = (int)(t->seg[0].dur / FRMS + 0.5f); if (t->nf < 1) t->nf = 1;
 }
 
